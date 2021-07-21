@@ -1,0 +1,240 @@
+AWSTemplateFormatVersion: 2010-09-09
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Network Configuration"
+        Parameters:
+          - VPC
+          - PublicSubnets
+          - PrivateSubnets
+          - DNSName
+      - Label:
+          default: "Container configuration"
+        Parameters:
+          - DockerImage
+          - ExecutionRoleArn
+          - TaskRoleArn
+      - Label:
+          default: "Environment configuration"
+        Parameters:
+          - AccessKeyId
+          - SecretAccessKey
+          - S3Bucket
+    ParameterLabels:
+      VPC:
+        default: "Select a VPC"
+      PublicSubnets:
+        default: "Select a public subnet(s)"
+      PrivateSubnets:
+        default: "Select a private subnet(s)"
+      DNSName:
+        default: "Insert subdomain name"
+      DockerImage:
+        default: "Insert docker image URL to use"
+      ExecutionRoleArn:
+        default: "Insert the role arn to execute task"
+      TaskRoleArn:
+        default: "Insert the role arn to task assume when is executing"
+      AccessKeyId:
+        default: "Insert AWS Access Key Id"
+      SecretAccessKey:
+        default: "Insert AWS Secret Access Key"
+      S3Bucket:
+        default: "Insert S3 bucket name"
+Parameters:
+  VPC:
+    Type: AWS::EC2::VPC::Id
+    Description: The VPC
+  PublicSubnets:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Public subnets, used to Load Balancer
+  PrivateSubnets:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Private subnets, used to cointainers instances
+  DNSName:
+    Type: String
+    Description: Name to create CNAME record
+    Default: npm-registry
+  DockerImage:
+    Type: String
+    Description: The docker image to use.
+    Default: 055954790429.dkr.ecr.us-east-1.amazonaws.com/verdaccio:latest
+  ExecutionRoleArn:
+    Type: String
+    Description: Role execute the task.
+    Default: arn:aws:iam::055954790429:role/ecsTaskExecutionRole
+  TaskRoleArn:
+    Type: String
+    Description: Role to be used by the task when running.
+    Default: arn:aws:iam::055954790429:role/ecsTaskExecutionRole
+  AccessKeyId:
+    Type: String
+    NoEcho: true
+    Description: An IAM user access key id for the S3 Bucket
+  SecretAccessKey:
+    Type: String
+    NoEcho: true
+    Description: An IAM user secret access key for the S3 Bucket
+  S3Bucket:
+    Type: String
+    Description: S3 bucket name to be used as package storage
+Resources:
+  FargateContainerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Access to the Fargate containers
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - CidrIp: 0.0.0.0/0
+          IpProtocol: -1
+      SecurityGroupEgress:
+        - CidrIp: 0.0.0.0/0
+          IpProtocol: -1
+  PublicLoadBalancerSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Access to the public facing load balancer
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - CidrIp: 0.0.0.0/0
+          IpProtocol: tcp
+          ToPort: 4873
+          FromPort: 4873
+      SecurityGroupEgress:
+        - CidrIp: 0.0.0.0/0
+          IpProtocol: tcp
+          ToPort: 4873
+          FromPort: 4873
+  PublicLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Scheme: internet-facing
+      LoadBalancerAttributes:
+      - Key: idle_timeout.timeout_seconds
+        Value: '30'
+      Subnets: !Ref PublicSubnets
+      SecurityGroups: [!Ref PublicLoadBalancerSG]
+  PublicLoadBalancerListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    DependsOn:
+      - PublicLoadBalancer
+    Properties:
+      DefaultActions:
+        - TargetGroupArn: !Ref TargetGroup
+          Type: forward
+      LoadBalancerArn: !Ref PublicLoadBalancer
+      Port: 4873
+      Protocol: HTTPS
+      SslPolicy: ELBSecurityPolicy-TLS-1-2-Ext-2018-06
+      Certificates: 
+        - CertificateArn: arn:aws:acm:us-east-1:055954790429:certificate/0691de31-62c6-4e24-829b-256490d94f0c
+  ECSCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: VerdaccioCluster
+      CapacityProviders:
+        - FARGATE
+      Tags:
+        - Key: stack
+          Value: verdaccio
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    DependsOn: 
+      LogGroup
+    Properties:
+      Family: VerdaccioTaskDefinition
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      Cpu: 1024
+      Memory: 2GB
+      ExecutionRoleArn: !Ref ExecutionRoleArn
+      TaskRoleArn: !Ref TaskRoleArn
+      ContainerDefinitions:
+        - Name: VerdaccioService
+          Image: !Ref DockerImage
+          Environment:
+            - Name: S3_BUCKET
+              Value: !Ref S3Bucket
+            - Name: AWS_ACCESS_KEY_ID
+              Value: !Ref AccessKeyId
+            - Name: AWS_SECRET_ACCESS_KEY
+              Value: !Ref SecretAccessKey
+            - Name: AWS_DEFAULT_REGION
+              Value: !Ref AWS::Region
+          PortMappings: 
+            - ContainerPort: 4873
+              Protocol: tcp
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-region: !Ref AWS::Region
+              awslogs-group: !Ref LogGroup
+              awslogs-stream-prefix: verdaccio
+  FargateService:
+    Type: AWS::ECS::Service
+    DependsOn: LoadBalancerRule
+    Properties:
+      ServiceName: VerdaccioService
+      Cluster: !Ref ECSCluster
+      LaunchType: FARGATE
+      DeploymentConfiguration:
+        MaximumPercent: 200
+        MinimumHealthyPercent: 100
+      DesiredCount: 1
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          SecurityGroups:
+            - !Ref FargateContainerSecurityGroup
+          Subnets: !Ref PrivateSubnets
+      TaskDefinition: !Ref TaskDefinition
+      LoadBalancers:
+        - ContainerName: VerdaccioService
+          ContainerPort: 4873
+          TargetGroupArn: !Ref TargetGroup
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      HealthCheckIntervalSeconds: 60
+      HealthCheckPath: /
+      HealthCheckProtocol: HTTP
+      HealthCheckPort: 4873
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      TargetType: ip
+      Name: verdaccio-target-group
+      Port: 4873
+      Protocol: HTTP
+      UnhealthyThresholdCount: 2
+      VpcId: !Ref VPC
+  LoadBalancerRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      Actions:
+        - TargetGroupArn: !Ref TargetGroup
+          Type: 'forward'
+      Conditions:
+        - Field: path-pattern
+          Values: ['*']
+      ListenerArn: !Ref PublicLoadBalancerListener
+      Priority: 1
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: VerdacccioLogs
+  DNSRecord:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId : Z3N05OGCHPZ4TC
+      Name: !Sub
+        - ${Domain}.minu.mx
+        - { Domain: !Ref DNSName }
+      Type: CNAME
+      TTL: '300'
+      ResourceRecords:
+      - !GetAtt PublicLoadBalancer.DNSName
+Outputs:
+  RegistryURL:
+    Description: URL to registry access
+    Value: !Join ['', ['https://', !Ref DNSName, '.minu.mx:4873']]
